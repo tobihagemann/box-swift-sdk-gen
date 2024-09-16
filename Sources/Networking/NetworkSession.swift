@@ -35,7 +35,7 @@ open class NetworkSession {
     ) {
         self.additionalHeaders = additionalHeaders
         self.configuration = configuration
-        self.session = URLSession(configuration: configuration, delegate: nil, delegateQueue: nil)
+        self.session = URLSession(configuration: configuration, delegate: NetworkClient.shared, delegateQueue: nil)
         self.networkSettings = networkSettings
         self.baseUrls = baseUrls
     }

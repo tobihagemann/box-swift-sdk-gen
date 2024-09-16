@@ -14,20 +14,29 @@ enum HTTPHeaderContentTypeValue {
 }
 
 /// Networking layer interface
-public class NetworkClient {
+public class NetworkClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate, URLSessionDataDelegate, URLSessionDownloadDelegate {
     public static let shared = NetworkClient()
 
     private let utilityQueue = DispatchQueue.global(qos: .utility)
 
-    private init(){}
+    // Continuations to bridge delegate callbacks to async/await
+    private var dataContinuations: [Int: CheckedContinuation<(Data, URLResponse), Error>] = [:]
+    private var downloadContinuations: [Int: CheckedContinuation<(URL, URLResponse), Error>] = [:]
+    private var dataAccumulators: [Int: Data] = [:]
+    private let continuationQueue = DispatchQueue(label: "BoxSdkGen.NetworkClient.continuationQueue.\(UUID().uuidString)")
+
+    private override init() {
+        super.init()
+    }
 
     /// Executes requests
     ///
     /// - Parameters:
     ///   - options: Request options  that provides request-specific information, such as the request type, and body, query parameters.
+    ///   - isUpload: A flag indicating whether this is an upload request.
     /// - Returns: Response of the request in the form of FetchResponse object.
     /// - Throws: An error if the request fails for any reason.
-    public func fetch(options: FetchOptions) async throws -> FetchResponse {
+    public func fetch(options: FetchOptions, isUpload: Bool = false) async throws -> FetchResponse {
         var options = options
         if let fileStream = options.fileStream, !(fileStream is MemoryInputStream) {
             let memoryInputStream = MemoryInputStream(data: Utils.readByteStream(byteStream: fileStream))
@@ -37,7 +46,8 @@ public class NetworkClient {
         return try await fetch(
             options: options,
             networkSession: options.networkSession ?? NetworkSession(),
-            attempt: 1
+            attempt: 1,
+            isUpload: isUpload
         )
     }
 
@@ -47,12 +57,14 @@ public class NetworkClient {
     ///   - options: Request options  that provides request-specific information, such as the request type, and body, query parameters.
     ///   - networkSession: The Networking Session object which provides the URLSession object along with a network configuration parameters used in network communication.
     ///   - attempt: The request attempt number.
+    ///   - isUpload: A flag indicating whether this is an upload request.
     /// - Returns: Response of the request in the form of FetchResponse object.
     /// - Throws: An error if the request fails for any reason.
     private func fetch(
         options: FetchOptions,
         networkSession: NetworkSession,
-        attempt: Int
+        attempt: Int,
+        isUpload: Bool
     ) async throws -> FetchResponse {
         let urlRequest = try await createRequest(
             options: options,
@@ -66,87 +78,73 @@ public class NetworkClient {
         if let downloadDestinationURL = options.downloadDestinationURL {
             let (downloadUrl, urlResponse) = try await sendDownloadRequest(urlRequest, downloadDestinationURL: downloadDestinationURL, networkSession: networkSession)
             let conversation = FetchConversation(options: options, urlRequest: urlRequest, urlResponse: urlResponse as! HTTPURLResponse, responseType: .url(downloadUrl))
-            return try await processResponse(using: conversation, networkSession: networkSession, attempt: attempt)
+            return try await processResponse(using: conversation, networkSession: networkSession, attempt: attempt, isUpload: isUpload)
+        } else if isUpload {
+            let (data, urlResponse) = try await sendUploadRequest(urlRequest, networkSession: networkSession)
+            let conversation = FetchConversation(options: options, urlRequest: urlRequest, urlResponse: urlResponse as! HTTPURLResponse, responseType: .data(data))
+            return try await processResponse(using: conversation, networkSession: networkSession, attempt: attempt, isUpload: isUpload)
         } else {
             let (data, urlResponse) =  try await sendDataRequest(urlRequest, networkSession: networkSession)
             let conversation = FetchConversation(options: options, urlRequest: urlRequest, urlResponse: urlResponse as! HTTPURLResponse, responseType: .data(data))
-            return try await processResponse(using: conversation, networkSession: networkSession, attempt: attempt)
+            return try await processResponse(using: conversation, networkSession: networkSession, attempt: attempt, isUpload: isUpload)
         }
     }
 
-    /// Executes data request using dataTask and converts it's callback based API into an async API.
+    /// Executes data request using dataTask and converts its callback-based API into an async API.
     ///
     /// - Parameters:
     ///   - urlRequest: The request object.
-    ///   - networkSession: The Networking Session object which provides the URLSession object along with a network configuration parameters used in network communication.
-    /// - Returns: Tuple of  of (Data, URLResponse)
+    ///   - networkSession: The Networking Session object which provides the URLSession object along with network configuration parameters used in network communication.
+    /// - Returns: Tuple of (Data, URLResponse)
     /// - Throws: An error if the request fails for any reason.
     private func sendDataRequest(_ urlRequest: URLRequest, networkSession: NetworkSession) async throws -> (Data, URLResponse) {
         return try await withCheckedThrowingContinuation { continuation in
-            networkSession.session.dataTask(with: urlRequest) { data, response, error in
-                if let error = error {
-                    continuation.resume(with: .failure(BoxNetworkError(message: error.localizedDescription, error: error)))
-                    return
-                }
-
-                guard let response = response else {
-                    continuation.resume(
-                        with: .failure(BoxNetworkError(message: "No response \(urlRequest.url?.absoluteString ?? "")."))
-                    )
-                    return
-                }
-
-                continuation.resume(
-                    with: .success((data ?? Data(), response))
-                )
+            continuationQueue.sync {
+                let task = networkSession.session.dataTask(with: urlRequest)
+                dataContinuations[task.taskIdentifier] = continuation
+                dataAccumulators[task.taskIdentifier] = Data()
+                task.resume()
             }
-            .resume()
         }
     }
 
-    /// Executes download request using downloadTask and converts it's callback based API into an async API.
+    /// Executes download request using downloadTask and converts its callback-based API into an async API.
     ///
     /// - Parameters:
     ///   - urlRequest: The request object.
-    ///   - networkSession: The Networking Session object which provides the URLSession object along with a network configuration parameters used in network communication.
-    /// - Returns: Tuple of  of (URL, URLResponse)
+    ///   - downloadDestinationURL: The local URL where the downloaded file should be moved.
+    ///   - networkSession: The Networking Session object which provides the URLSession object along with network configuration parameters used in network communication.
+    /// - Returns: Tuple of (URL, URLResponse)
     /// - Throws: An error if the request fails for any reason.
     private func sendDownloadRequest(_ urlRequest: URLRequest, downloadDestinationURL: URL, networkSession: NetworkSession) async throws -> (URL, URLResponse) {
         return try await withCheckedThrowingContinuation { continuation in
-            networkSession.session.downloadTask(with: urlRequest) { location, response, error in
-                if let error = error {
-                    continuation.resume(with: .failure(BoxNetworkError(message: error.localizedDescription, error: error)))
-                    return
-                }
+            continuationQueue.sync {
+                let task = networkSession.session.downloadTask(with: urlRequest)
+                downloadContinuations[task.taskIdentifier] = continuation
+                task.resume()
+            }
+        }
+    }
 
-                guard let localURL = location else {
-                    continuation.resume(
-                        with: .failure(BoxNetworkError(message: "File was not downloaded \(urlRequest.url?.absoluteString ?? "")"))
-                    )
-                    return
-                }
-
-                guard let response = response else {
-                    continuation.resume(
-                        with: .failure(BoxNetworkError(message: "No response \(urlRequest.url?.absoluteString ?? "")."))
-                    )
-                    return
-                }
-
-                do {
-                    try? FileManager.default.removeItem(at: downloadDestinationURL)
-                    try FileManager.default.moveItem(at: localURL, to: downloadDestinationURL)
-                }
-                catch {
-                    continuation.resume(
-                        with: .failure(BoxSDKError(message: "Could not move item from temporary download location \(localURL.absoluteString) to download destination \(downloadDestinationURL.absoluteString)."))
-                    )
-                }
-
-                continuation.resume(
-                    with: .success((downloadDestinationURL, response))
-                )
-            }.resume()
+    /// Executes upload request using uploadTask and converts its delegate-based API into an async API.
+    ///
+    /// - Parameters:
+    ///   - urlRequest: The request object.
+    ///   - networkSession: The Networking Session object which provides the URLSession object along with network configuration parameters used in network communication.
+    /// - Returns: Tuple of (Data, URLResponse)
+    /// - Throws: An error if the request fails for any reason.
+    private func sendUploadRequest(_ urlRequest: URLRequest, networkSession: NetworkSession) async throws -> (Data, URLResponse) {
+        return try await withCheckedThrowingContinuation { continuation in
+            guard let httpBody = urlRequest.httpBody else {
+                continuation.resume(throwing: BoxNetworkError(message: "HTTP body is nil for upload request."))
+                return
+            }
+            continuationQueue.sync {
+                let task = networkSession.session.uploadTask(with: urlRequest, from: httpBody)
+                dataContinuations[task.taskIdentifier] = continuation
+                dataAccumulators[task.taskIdentifier] = Data()
+                task.resume()
+            }
         }
     }
 
@@ -319,7 +317,8 @@ public class NetworkClient {
     private func processResponse(
         using conversation: FetchConversation,
         networkSession: NetworkSession,
-        attempt: Int
+        attempt: Int,
+        isUpload: Bool
     ) async throws -> FetchResponse {
         let statusCode = conversation.urlResponse.statusCode
         let isStatusCodeAcceptedWithRetryAfterHeader = statusCode == 202 && conversation.urlResponse.value(forHTTPHeaderField: HTTPHeaderKey.retryAfter) != nil
@@ -337,7 +336,7 @@ public class NetworkClient {
         // Unauthorized
         if statusCode == 401, let auth = conversation.options.auth  {
             _ = try await auth.refreshToken(networkSession: networkSession)
-            return try await fetch(options: conversation.options, networkSession: networkSession, attempt: attempt + 1)
+            return try await fetch(options: conversation.options, networkSession: networkSession, attempt: attempt + 1, isUpload: isUpload)
         }
 
         // Retryable
@@ -346,7 +345,7 @@ public class NetworkClient {
             ?? networkSession.networkSettings.retryStrategy.getRetryTimeout(attempt: attempt)
             try await wait(seconds: retryTimeout)
 
-            return try await fetch(options: conversation.options, networkSession: networkSession, attempt: attempt + 1)
+            return try await fetch(options: conversation.options, networkSession: networkSession, attempt: attempt + 1, isUpload: isUpload)
         }
 
         throw BoxAPIError(fromConversation: conversation)
@@ -364,6 +363,73 @@ public class NetworkClient {
             ) {
                 continuation.resume()
             }
+        }
+    }
+}
+
+// MARK: - URLSessionDelegate Methods
+
+extension NetworkClient {
+    // Handle task completion
+    public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        // Handle Data and Upload Tasks
+        if let continuation = dataContinuations[task.taskIdentifier] {
+            dataContinuations[task.taskIdentifier] = nil
+
+            if let error = error {
+                dataAccumulators[task.taskIdentifier] = nil
+                continuation.resume(throwing: BoxNetworkError(message: error.localizedDescription, error: error))
+                return
+            }
+
+            guard let response = task.response else {
+                dataAccumulators[task.taskIdentifier] = nil
+                continuation.resume(throwing: BoxNetworkError(message: "No response received for task. URL: \(task.originalRequest?.url?.absoluteString ?? "unknown")"))
+                return
+            }
+
+            // Retrieve accumulated data
+            let accumulatedData = dataAccumulators[task.taskIdentifier] ?? Data()
+            dataAccumulators[task.taskIdentifier] = nil
+            continuation.resume(returning: (accumulatedData, response))
+        }
+
+        // Handle Download Tasks
+        if let continuation = downloadContinuations[task.taskIdentifier] {
+            downloadContinuations[task.taskIdentifier] = nil
+            if let error = error {
+                continuation.resume(throwing: BoxNetworkError(message: error.localizedDescription, error: error))
+                return
+            }
+
+            // Completion is handled in `didFinishDownloadingTo`
+            // No action needed here
+        }
+    }
+
+    // Handle data received for data and upload tasks
+    public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        if let continuation = dataContinuations[dataTask.taskIdentifier] {
+            // Initialize accumulator if not present
+            if dataAccumulators[dataTask.taskIdentifier] == nil {
+                dataAccumulators[dataTask.taskIdentifier] = Data()
+            }
+
+            // Append received data
+            dataAccumulators[dataTask.taskIdentifier]?.append(data)
+        }
+    }
+
+    // Handle download completion
+    public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        if let continuation = downloadContinuations[downloadTask.taskIdentifier] {
+            downloadContinuations[downloadTask.taskIdentifier] = nil
+            guard let response = downloadTask.response else {
+                continuation.resume(throwing: BoxNetworkError(message: "No response received for download task. URL: \(downloadTask.originalRequest?.url?.absoluteString ?? "unknown")"))
+                return
+            }
+
+            continuation.resume(returning: (location, response))
         }
     }
 }

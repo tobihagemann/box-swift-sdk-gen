@@ -92,7 +92,7 @@ public class ChunkedUploadsManager {
     /// - Throws: The `GeneralError`.
     public func uploadFilePartByUrl(url: String, requestBody: InputStream, headers: UploadFilePartByUrlHeaders) async throws -> UploadedPart {
         let headersMap: [String: String] = Utils.Dictionary.prepareParams(map: Utils.Dictionary.merge(["digest": Utils.Strings.toString(value: headers.digest), "content-range": Utils.Strings.toString(value: headers.contentRange)], headers.extraHeaders))
-        let response: FetchResponse = try await NetworkClient.shared.fetch(options: FetchOptions(url: url, method: "PUT", headers: headersMap, fileStream: requestBody, contentType: "application/octet-stream", responseFormat: "json", auth: self.auth, networkSession: self.networkSession))
+        let response: FetchResponse = try await NetworkClient.shared.fetch(options: FetchOptions(url: url, method: "PUT", headers: headersMap, fileStream: requestBody, contentType: "application/octet-stream", responseFormat: "json", auth: self.auth, networkSession: self.networkSession), isUpload: true)
         return try UploadedPart.deserialize(from: response.data)
     }
 
@@ -110,7 +110,7 @@ public class ChunkedUploadsManager {
     /// - Throws: The `GeneralError`.
     public func uploadFilePart(uploadSessionId: String, requestBody: InputStream, headers: UploadFilePartHeaders) async throws -> UploadedPart {
         let headersMap: [String: String] = Utils.Dictionary.prepareParams(map: Utils.Dictionary.merge(["digest": Utils.Strings.toString(value: headers.digest), "content-range": Utils.Strings.toString(value: headers.contentRange)], headers.extraHeaders))
-        let response: FetchResponse = try await NetworkClient.shared.fetch(options: FetchOptions(url: "\(self.networkSession.baseUrls.uploadUrl)\("/2.0/files/upload_sessions/")\(uploadSessionId)", method: "PUT", headers: headersMap, fileStream: requestBody, contentType: "application/octet-stream", responseFormat: "json", auth: self.auth, networkSession: self.networkSession))
+        let response: FetchResponse = try await NetworkClient.shared.fetch(options: FetchOptions(url: "\(self.networkSession.baseUrls.uploadUrl)\("/2.0/files/upload_sessions/")\(uploadSessionId)", method: "PUT", headers: headersMap, fileStream: requestBody, contentType: "application/octet-stream", responseFormat: "json", auth: self.auth, networkSession: self.networkSession), isUpload: true)
         return try UploadedPart.deserialize(from: response.data)
     }
 
