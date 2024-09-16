@@ -18,12 +18,8 @@ public class NetworkClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate
     public static let shared = NetworkClient()
 
     private let utilityQueue = DispatchQueue.global(qos: .utility)
-
-    // Continuations to bridge delegate callbacks to async/await
-    private var dataContinuations: [Int: CheckedContinuation<(Data, URLResponse), Error>] = [:]
-    private var downloadContinuations: [Int: CheckedContinuation<(URL, URLResponse), Error>] = [:]
-    private var dataAccumulators: [Int: Data] = [:]
     private let continuationQueue = DispatchQueue(label: "BoxSdkGen.NetworkClient.continuationQueue.\(UUID().uuidString)")
+    private var taskInfos: [Int: TaskInfo] = [:]
 
     private override init() {
         super.init()
@@ -37,12 +33,6 @@ public class NetworkClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate
     /// - Returns: Response of the request in the form of FetchResponse object.
     /// - Throws: An error if the request fails for any reason.
     public func fetch(options: FetchOptions, isUpload: Bool = false) async throws -> FetchResponse {
-        var options = options
-        if let fileStream = options.fileStream, !(fileStream is MemoryInputStream) {
-            let memoryInputStream = MemoryInputStream(data: Utils.readByteStream(byteStream: fileStream))
-            options = options.withFileStream(fileStream: memoryInputStream)
-        }
-
         return try await fetch(
             options: options,
             networkSession: options.networkSession ?? NetworkSession(),
@@ -71,20 +61,16 @@ public class NetworkClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate
             networkSession: networkSession
         )
 
-        if let fileStream = options.fileStream, let memoryInputStream = fileStream as? MemoryInputStream, attempt > 1 {
-            memoryInputStream.reset()
-        }
-
         if let downloadDestinationURL = options.downloadDestinationURL {
             let (downloadUrl, urlResponse) = try await sendDownloadRequest(urlRequest, downloadDestinationURL: downloadDestinationURL, networkSession: networkSession)
             let conversation = FetchConversation(options: options, urlRequest: urlRequest, urlResponse: urlResponse as! HTTPURLResponse, responseType: .url(downloadUrl))
             return try await processResponse(using: conversation, networkSession: networkSession, attempt: attempt, isUpload: isUpload)
         } else if isUpload {
-            let (data, urlResponse) = try await sendUploadRequest(urlRequest, networkSession: networkSession)
+            let (data, urlResponse) = try await sendUploadRequest(urlRequest, options: options, networkSession: networkSession)
             let conversation = FetchConversation(options: options, urlRequest: urlRequest, urlResponse: urlResponse as! HTTPURLResponse, responseType: .data(data))
             return try await processResponse(using: conversation, networkSession: networkSession, attempt: attempt, isUpload: isUpload)
         } else {
-            let (data, urlResponse) =  try await sendDataRequest(urlRequest, networkSession: networkSession)
+            let (data, urlResponse) = try await sendDataRequest(urlRequest, networkSession: networkSession)
             let conversation = FetchConversation(options: options, urlRequest: urlRequest, urlResponse: urlResponse as! HTTPURLResponse, responseType: .data(data))
             return try await processResponse(using: conversation, networkSession: networkSession, attempt: attempt, isUpload: isUpload)
         }
@@ -101,8 +87,8 @@ public class NetworkClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate
         return try await withCheckedThrowingContinuation { continuation in
             continuationQueue.sync {
                 let task = networkSession.session.dataTask(with: urlRequest)
-                dataContinuations[task.taskIdentifier] = continuation
-                dataAccumulators[task.taskIdentifier] = Data()
+                let taskInfo = DataTaskInfo(continuation: continuation)
+                taskInfos[task.taskIdentifier] = taskInfo
                 task.resume()
             }
         }
@@ -120,7 +106,8 @@ public class NetworkClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate
         return try await withCheckedThrowingContinuation { continuation in
             continuationQueue.sync {
                 let task = networkSession.session.downloadTask(with: urlRequest)
-                downloadContinuations[task.taskIdentifier] = continuation
+                let taskInfo = DownloadTaskInfo(continuation: continuation, destinationURL: downloadDestinationURL)
+                taskInfos[task.taskIdentifier] = taskInfo
                 task.resume()
             }
         }
@@ -133,29 +120,86 @@ public class NetworkClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate
     ///   - networkSession: The Networking Session object which provides the URLSession object along with network configuration parameters used in network communication.
     /// - Returns: Tuple of (Data, URLResponse)
     /// - Throws: An error if the request fails for any reason.
-    private func sendUploadRequest(_ urlRequest: URLRequest, networkSession: NetworkSession) async throws -> (Data, URLResponse) {
+    private func sendUploadRequest(_ urlRequest: URLRequest, options: FetchOptions, networkSession: NetworkSession) async throws -> (Data, URLResponse) {
         return try await withCheckedThrowingContinuation { continuation in
-            guard let httpBody = urlRequest.httpBody else {
-                continuation.resume(throwing: BoxNetworkError(message: "HTTP body is nil for upload request."))
-                return
-            }
             continuationQueue.sync {
-                let task = networkSession.session.uploadTask(with: urlRequest, from: httpBody)
-                dataContinuations[task.taskIdentifier] = continuation
-                dataAccumulators[task.taskIdentifier] = Data()
-                task.resume()
+                if let serializedData = options.data {
+                    let task = networkSession.session.uploadTask(with: urlRequest, from: serializedData.data)
+                    let taskInfo = DataTaskInfo(continuation: continuation)
+                    taskInfos[task.taskIdentifier] = taskInfo
+                    task.resume()
+                } else if let fileURL = options.fileURL {
+                    let task = networkSession.session.uploadTask(with: urlRequest, fromFile: fileURL)
+                    let taskInfo = DataTaskInfo(continuation: continuation)
+                    taskInfos[task.taskIdentifier] = taskInfo
+                    task.resume()
+                } else if let multipartData = options.multipartData {
+                    do {
+                        var mutableRequest = urlRequest
+                        let tempFileURL = try updateRequestWithMultipartData(&mutableRequest, multipartData: multipartData)
+                        let task = networkSession.session.uploadTask(with: mutableRequest, fromFile: tempFileURL)
+                        let taskInfo = DataTaskInfo(continuation: continuation, multipartTempFileURL: tempFileURL)
+                        taskInfos[task.taskIdentifier] = taskInfo
+                        task.resume()
+                    } catch {
+                        continuation.resume(throwing: error)
+                        return
+                    }
+                }
             }
         }
     }
 
-    /// Creates the request object `URLRequest` based on  parameters passed in `options`.
+    /// Updates the passed request object `URLRequest` with multipart data, based on parameters passed in `multipartData`.
     ///
     /// - Parameters:
-    ///   - url: The URL for the request.
-    ///   - options: Request options  that provides request-specific information, such as the request type, and body, query parameters.
-    ///   - networkSession: The Networking Session object which provides the URLSession object along with a network configuration parameters used in network communication.
-    /// - Returns: The URLRequest object which represents information about the request.
-    /// - Throws: An error if the operation fails for any reason.
+    ///   - urlRequest: The request object.
+    ///   - multipartData: An array of `MultipartItem` which will be used to create the body of the request.
+    /// - Returns: The URL of the multipart file created.
+    /// - Throws: An error if writing fails.
+    private func updateRequestWithMultipartData(_ urlRequest: inout URLRequest, multipartData: [MultipartItem]) throws -> URL {
+        let boundary = "Boundary-\(UUID().uuidString)"
+        urlRequest.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: HTTPHeaderKey.contentType)
+        urlRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+        return try createMultipartFile(multipartData: multipartData, boundary: boundary)
+    }
+
+    /// Creates a multipart/form-data file based on passed arguments.
+    ///
+    /// - Parameters:
+    ///   - multipartData: Array of `MultipartItem`.
+    ///   - boundary: The boundary string.
+    /// - Throws: An error if writing fails.
+    /// - Returns: The URL of the multipart file created.
+    private func createMultipartFile(multipartData: [MultipartItem], boundary: String) throws -> URL {
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let outputStream = OutputStream(url: fileURL, append: false)!
+        outputStream.open()
+        defer { outputStream.close() }
+        for part in multipartData {
+            try outputStream.write("--\(boundary)\r\n")
+            if let serializedData = part.data {
+                try outputStream.write("Content-Disposition: form-data; name=\"\(part.partName)\"\r\n\r\n")
+                try outputStream.write(Utils.Strings.from(data: try serializedData.toJson()))
+                try outputStream.write("\r\n")
+            } else if let fileURL = part.fileURL {
+                try outputStream.write("Content-Disposition: form-data; name=\"\(part.partName)\"; filename=\"\(part.fileName ?? "")\"\r\n")
+                try outputStream.write("Content-Type: \(part.contentType ?? "")\r\n\r\n")
+                try outputStream.write(contentsOf: fileURL)
+                try outputStream.write("\r\n")
+            }
+        }
+        try outputStream.write("--\(boundary)--\r\n")
+        return fileURL
+    }
+
+    /// Creates the `URLRequest` based on the provided `FetchOptions`.
+    ///
+    /// - Parameters:
+    ///   - options: Fetch options.
+    ///   - networkSession: Networking session configuration.
+    /// - Returns: Configured `URLRequest`.
+    /// - Throws: An error if the operation fails.
     private func createRequest(
         options: FetchOptions,
         networkSession: NetworkSession
@@ -165,13 +209,9 @@ public class NetworkClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate
 
         try await updateRequestWithHeaders(&urlRequest, options: options, networkSession: networkSession)
 
-        if let fileStream = options.fileStream {
-            urlRequest.httpBodyStream = fileStream
-        } else if let multipartData = options.multipartData {
-            try updateRequestWithMultipartData(&urlRequest, multipartData: multipartData)
-        }
-
-        if let serializedData = options.data {
+        if options.multipartData != nil || options.fileURL != nil {
+            // Do not set httpBody or httpBodyStream
+        } else if let serializedData = options.data {
             if HTTPHeaderContentTypeValue.urlEncoded == options.contentType {
                 urlRequest.httpBody = (try serializedData.toUrlParams()).data(using: .utf8)
             } else {
@@ -196,7 +236,7 @@ public class NetworkClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate
             urlRequest.setValue(value, forHTTPHeaderField: key)
         }
 
-        if let contentType = options.contentType {
+        if let contentType = options.contentType, options.multipartData == nil {
             urlRequest.setValue(contentType, forHTTPHeaderField: HTTPHeaderKey.contentType)
         }
 
@@ -218,74 +258,6 @@ public class NetworkClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate
         if let auth = options.auth, let token = (try await auth.retrieveToken(networkSession: networkSession)).accessToken {
             urlRequest.setValue("Bearer \(token)", forHTTPHeaderField: HTTPHeaderKey.authorization)
         }
-    }
-
-    /// Updates the passed request object `URLRequest` with multipart data,  based on  parameters passed in `multipartData`.
-    ///
-    /// - Parameters:
-    ///   - urlRequest: The request object.
-    ///   - multipartData: An array of `MultipartItem` which will be used to create the body of the request.
-    private func updateRequestWithMultipartData(_ urlRequest: inout URLRequest, multipartData: [MultipartItem]) throws {
-        var parameters: [String: Any] = [:]
-        var partName = ""
-        var fileName = ""
-        var mimeType = ""
-        var bodyStream = InputStream(data: Data())
-        let boundary = "Boundary-\(UUID().uuidString)"
-        for part in multipartData {
-            if let body = part.data {
-                parameters[part.partName] = Utils.Strings.from(data: try body.toJson())
-            } else if let fileStream = part.fileStream {
-                let unwrapFileName = part.fileName ?? ""
-                let unwrapMimeType = part.contentType ?? ""
-
-                partName = part.partName
-                fileName = unwrapFileName
-                mimeType = unwrapMimeType
-                bodyStream = fileStream
-            }
-        }
-
-        let bodyStreams = createMultipartBodyStreams(parameters, partName: partName, fileName: fileName, mimetype: mimeType, bodyStream: bodyStream, boundary: boundary)
-        urlRequest.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: HTTPHeaderKey.contentType)
-        urlRequest.setValue("application/json", forHTTPHeaderField: "Accept")
-        urlRequest.httpBodyStream = ArrayInputStream(inputStreams: bodyStreams)
-    }
-
-    /// Creates an array of `InputStream`based on passed arguments, which will be used as an bodyStream of the request.
-    ///
-    /// - Parameters:
-    ///   - parameters: The parameters of the multipart request in form of a Dictionary.
-    ///   - partName: The name of the file part.
-    ///   - fileName: The file name.
-    ///   - mimetype: The content type of the file part.
-    ///   - bodyStream: The stream containing the file contents.
-    ///   - boundary: The boundary value,  used to separate name/value pair.
-    /// - Returns: An array of `InputStream`streams.
-    private func createMultipartBodyStreams(_ parameters: [String: Any]?, partName: String, fileName: String, mimetype: String, bodyStream: InputStream, boundary: String) -> [InputStream] {
-        var preBody = Data()
-        if let parameters = parameters {
-            for (key, value) in parameters {
-                preBody.append("--\(boundary)\r\n".data(using: .utf8)!)
-                preBody.append("Content-Disposition: form-data; name=\"\(key)\"\r\n\r\n".data(using: .utf8)!)
-                preBody.append("\(value)\r\n".data(using: .utf8)!)
-            }
-        }
-
-        preBody.append("--\(boundary)\r\n".data(using: .utf8)!)
-        preBody.append("Content-Disposition: form-data; name=\"\(partName)\"; filename=\"\(fileName)\"\r\n".data(using: .utf8)!)
-        preBody.append("Content-Type: \(mimetype)\r\n\r\n".data(using: .utf8)!)
-
-        var postBody = Data()
-        postBody.append("\r\n".data(using: .utf8)!)
-        postBody.append("--\(boundary)--\r\n".data(using: .utf8)!)
-
-        var bodyStreams: [InputStream] = []
-        bodyStreams.append(InputStream(data: preBody))
-        bodyStreams.append(bodyStream)
-        bodyStreams.append(InputStream(data: postBody))
-
-        return bodyStreams
     }
 
     /// Creates a `URL`object  based on url and query parameters
@@ -370,66 +342,51 @@ public class NetworkClient: NSObject, URLSessionDelegate, URLSessionTaskDelegate
 // MARK: - URLSessionDelegate Methods
 
 extension NetworkClient {
-    // Handle task completion
     public func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        // Handle Data and Upload Tasks
-        if let continuation = dataContinuations[task.taskIdentifier] {
-            dataContinuations[task.taskIdentifier] = nil
-
-            if let error = error {
-                dataAccumulators[task.taskIdentifier] = nil
-                continuation.resume(throwing: BoxNetworkError(message: error.localizedDescription, error: error))
-                return
+        continuationQueue.sync {
+            guard let taskInfo = taskInfos[task.taskIdentifier] else { return }
+            switch taskInfo {
+            case let dataTaskInfo as DataTaskInfo:
+                taskInfos.removeValue(forKey: task.taskIdentifier)
+                if let error = error {
+                    dataTaskInfo.continuation.resume(throwing: BoxNetworkError(message: error.localizedDescription, error: error))
+                    return
+                }
+                guard let response = task.response else {
+                    dataTaskInfo.continuation.resume(throwing: BoxNetworkError(message: "No response received for task. URL: \(task.originalRequest?.url?.absoluteString ?? "unknown")"))
+                    return
+                }
+                if let tempFileURL = dataTaskInfo.multipartTempFileURL {
+                    try? FileManager.default.removeItem(at: tempFileURL)
+                }
+                dataTaskInfo.continuation.resume(returning: (dataTaskInfo.accumulatedData, response))
+            case let downloadTaskInfo as DownloadTaskInfo:
+                taskInfos.removeValue(forKey: task.taskIdentifier)
+                if let error = error {
+                    downloadTaskInfo.continuation.resume(throwing: BoxNetworkError(message: error.localizedDescription, error: error))
+                }
+            default:
+                break
             }
-
-            guard let response = task.response else {
-                dataAccumulators[task.taskIdentifier] = nil
-                continuation.resume(throwing: BoxNetworkError(message: "No response received for task. URL: \(task.originalRequest?.url?.absoluteString ?? "unknown")"))
-                return
-            }
-
-            // Retrieve accumulated data
-            let accumulatedData = dataAccumulators[task.taskIdentifier] ?? Data()
-            dataAccumulators[task.taskIdentifier] = nil
-            continuation.resume(returning: (accumulatedData, response))
-        }
-
-        // Handle Download Tasks
-        if let continuation = downloadContinuations[task.taskIdentifier] {
-            downloadContinuations[task.taskIdentifier] = nil
-            if let error = error {
-                continuation.resume(throwing: BoxNetworkError(message: error.localizedDescription, error: error))
-                return
-            }
-
-            // Completion is handled in `didFinishDownloadingTo`
-            // No action needed here
         }
     }
 
-    // Handle data received for data and upload tasks
     public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        if let continuation = dataContinuations[dataTask.taskIdentifier] {
-            // Initialize accumulator if not present
-            if dataAccumulators[dataTask.taskIdentifier] == nil {
-                dataAccumulators[dataTask.taskIdentifier] = Data()
-            }
-
-            // Append received data
-            dataAccumulators[dataTask.taskIdentifier]?.append(data)
+        continuationQueue.sync {
+            guard let dataTaskInfo = taskInfos[dataTask.taskIdentifier] as? DataTaskInfo else { return }
+            dataTaskInfo.accumulatedData.append(data)
         }
     }
 
-    // Handle download completion
     public func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
-        if let continuation = downloadContinuations[downloadTask.taskIdentifier] {
-            downloadContinuations[downloadTask.taskIdentifier] = nil
-            guard let response = downloadTask.response else {
-                continuation.resume(throwing: BoxNetworkError(message: "No response received for download task. URL: \(downloadTask.originalRequest?.url?.absoluteString ?? "unknown")"))
-                return
+        continuationQueue.sync {
+            guard let downloadTaskInfo = taskInfos[downloadTask.taskIdentifier] as? DownloadTaskInfo else { return }
+            do {
+                try FileManager.default.moveItem(at: location, to: downloadTaskInfo.destinationURL)
+                downloadTaskInfo.continuation.resume(returning: (downloadTaskInfo.destinationURL, downloadTask.response!))
+            } catch {
+                downloadTaskInfo.continuation.resume(throwing: BoxSDKError(message: "Could not move downloaded file: \(error.localizedDescription)"))
             }
-
-            continuation.resume(returning: (location, response))
         }
     }
 }

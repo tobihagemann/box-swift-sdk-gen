@@ -288,17 +288,16 @@ public enum Utils {
         FileManager.default.temporaryDirectory.absoluteString
     }
 
-
-    /// Creates a StreamSequence from a given InputStream.
+    /// Creates a URLSequence from a given file, splitting it into chunks.
     ///
     /// - Parameters:
-    ///   - stream: InputStream to iterate over
-    ///   - chunkSize: Size of chunk
-    ///   - fileSize: Size of the file
-    /// - Returns: The StreamSequence
-    public static func iterateChunks(stream: InputStream, chunkSize: Int64, fileSize: Int64) -> StreamSequence {
-        return StreamSequence(inputStream: stream, chunkSize: Int(chunkSize))
-   }
+    ///   - fileURL: The local file URL of the file to split into chunks.
+    ///   - chunkSize: The size of each chunk in bytes.
+    ///   - fileSize: The total size of the file in bytes.
+    /// - Returns: A `URLSequence` that yields URLs to the chunk files.
+    public static func iterateChunks(fileURL: URL, chunkSize: Int64, fileSize: Int64) -> URLSequence {
+        return URLSequence(fileURL: fileURL, chunkSize: Int(chunkSize), fileSize: Int(fileSize))
+    }
 
     /// Asynchronously reduces the elements of an `Sequence` using a specified reducer function and initial value.
     ///

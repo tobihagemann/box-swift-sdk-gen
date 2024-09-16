@@ -9,8 +9,8 @@ public class MultipartItem {
     /// The content of the part body.
     public let data: SerializedData?
 
-    /// A stream containing the file contents.
-    public let fileStream: InputStream?
+    /// The local file URL containing the file to be uploaded.
+    public let fileURL: URL?
 
     /// The name of the file.
     public let fileName: String?
@@ -22,20 +22,20 @@ public class MultipartItem {
     ///
     /// - Parameters:
     ///   - partName: The name of the part.
-    ///   - body: The content of file part body.
-    ///   - fileStream: A stream containing the file contents.
+    ///   - data: The content of the part body.
+    ///   - fileURL: The local file URL containing the file to be uploaded.
     ///   - fileName: The name of the file.
     ///   - contentType: The content type of the part.
     public init(
         partName: String,
         data: SerializedData? = nil,
-        fileStream: InputStream? = nil,
+        fileURL: URL? = nil,
         fileName: String? = nil,
         contentType: String? = nil
     ) {
         self.partName = partName
         self.data = data
-        self.fileStream = fileStream
+        self.fileURL = fileURL
         self.fileName = fileName
         self.contentType = contentType
     }

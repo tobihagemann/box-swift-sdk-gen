@@ -36,7 +36,7 @@ public class AvatarsManager {
     /// - Throws: The `GeneralError`.
     public func createUserAvatar(userId: String, requestBody: CreateUserAvatarRequestBody, headers: CreateUserAvatarHeaders = CreateUserAvatarHeaders()) async throws -> UserAvatar {
         let headersMap: [String: String] = Utils.Dictionary.prepareParams(map: Utils.Dictionary.merge([:], headers.extraHeaders))
-        let response: FetchResponse = try await NetworkClient.shared.fetch(options: FetchOptions(url: "\(self.networkSession.baseUrls.baseUrl)\("/2.0/users/")\(userId)\("/avatar")", method: "POST", headers: headersMap, multipartData: [MultipartItem(partName: "pic", fileStream: requestBody.pic, fileName: requestBody.picFileName, contentType: requestBody.picContentType)], contentType: "multipart/form-data", responseFormat: "json", auth: self.auth, networkSession: self.networkSession))
+        let response: FetchResponse = try await NetworkClient.shared.fetch(options: FetchOptions(url: "\(self.networkSession.baseUrls.baseUrl)\("/2.0/users/")\(userId)\("/avatar")", method: "POST", headers: headersMap, multipartData: [MultipartItem(partName: "pic", fileURL: requestBody.pic, fileName: requestBody.picFileName, contentType: requestBody.picContentType)], contentType: "multipart/form-data", responseFormat: "json", auth: self.auth, networkSession: self.networkSession), isUpload: true)
         return try UserAvatar.deserialize(from: response.data)
     }
 

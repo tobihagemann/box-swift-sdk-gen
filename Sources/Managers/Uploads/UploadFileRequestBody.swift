@@ -15,7 +15,7 @@ public class UploadFileRequestBody {
     /// </Message>
     public let attributes: UploadFileRequestBodyAttributesField
 
-    /// The content of the file to upload to Box.
+    /// The local file URL of the file to upload to Box.
     /// 
     /// <Message warning>
     /// 
@@ -25,7 +25,7 @@ public class UploadFileRequestBody {
     ///   `metadata_after_file_contents` error code.
     /// 
     /// </Message>
-    public let file: InputStream
+    public let fileURL: URL
 
     public let fileFileName: String?
 
@@ -46,7 +46,7 @@ public class UploadFileRequestBody {
     ///       `metadata_after_file_contents` error code.
     ///     
     ///     </Message>
-    ///   - file: The content of the file to upload to Box.
+    ///   - file: The local file URL of the file to upload to Box.
     ///     
     ///     <Message warning>
     ///     
@@ -58,9 +58,9 @@ public class UploadFileRequestBody {
     ///     </Message>
     ///   - fileFileName: 
     ///   - fileContentType: 
-    public init(attributes: UploadFileRequestBodyAttributesField, file: InputStream, fileFileName: String? = nil, fileContentType: String? = nil) {
+    public init(attributes: UploadFileRequestBodyAttributesField, fileURL: URL, fileFileName: String? = nil, fileContentType: String? = nil) {
         self.attributes = attributes
-        self.file = file
+        self.fileURL = fileURL
         self.fileFileName = fileFileName
         self.fileContentType = fileContentType
     }

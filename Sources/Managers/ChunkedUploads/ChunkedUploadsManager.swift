@@ -86,13 +86,13 @@ public class ChunkedUploadsManager {
     ///
     /// - Parameters:
     ///   - url: URL of uploadFilePart method
-    ///   - requestBody: Request body of uploadFilePart method
+    ///   - requestBody: The local file URL of the chunk to upload.
     ///   - headers: Headers of uploadFilePart method
     /// - Returns: The `UploadedPart`.
     /// - Throws: The `GeneralError`.
-    public func uploadFilePartByUrl(url: String, requestBody: InputStream, headers: UploadFilePartByUrlHeaders) async throws -> UploadedPart {
+    public func uploadFilePartByUrl(url: String, requestBody: URL, headers: UploadFilePartByUrlHeaders) async throws -> UploadedPart {
         let headersMap: [String: String] = Utils.Dictionary.prepareParams(map: Utils.Dictionary.merge(["digest": Utils.Strings.toString(value: headers.digest), "content-range": Utils.Strings.toString(value: headers.contentRange)], headers.extraHeaders))
-        let response: FetchResponse = try await NetworkClient.shared.fetch(options: FetchOptions(url: url, method: "PUT", headers: headersMap, fileStream: requestBody, contentType: "application/octet-stream", responseFormat: "json", auth: self.auth, networkSession: self.networkSession), isUpload: true)
+        let response: FetchResponse = try await NetworkClient.shared.fetch(options: FetchOptions(url: url, method: "PUT", headers: headersMap, fileURL: requestBody, contentType: "application/octet-stream", responseFormat: "json", auth: self.auth, networkSession: self.networkSession), isUpload: true)
         return try UploadedPart.deserialize(from: response.data)
     }
 
@@ -104,13 +104,13 @@ public class ChunkedUploadsManager {
     /// - Parameters:
     ///   - uploadSessionId: The ID of the upload session.
     ///     Example: "D5E3F7A"
-    ///   - requestBody: Request body of uploadFilePart method
+    ///   - requestBody: The local file URL of the chunk to upload.
     ///   - headers: Headers of uploadFilePart method
     /// - Returns: The `UploadedPart`.
     /// - Throws: The `GeneralError`.
-    public func uploadFilePart(uploadSessionId: String, requestBody: InputStream, headers: UploadFilePartHeaders) async throws -> UploadedPart {
+    public func uploadFilePart(uploadSessionId: String, requestBody: URL, headers: UploadFilePartHeaders) async throws -> UploadedPart {
         let headersMap: [String: String] = Utils.Dictionary.prepareParams(map: Utils.Dictionary.merge(["digest": Utils.Strings.toString(value: headers.digest), "content-range": Utils.Strings.toString(value: headers.contentRange)], headers.extraHeaders))
-        let response: FetchResponse = try await NetworkClient.shared.fetch(options: FetchOptions(url: "\(self.networkSession.baseUrls.uploadUrl)\("/2.0/files/upload_sessions/")\(uploadSessionId)", method: "PUT", headers: headersMap, fileStream: requestBody, contentType: "application/octet-stream", responseFormat: "json", auth: self.auth, networkSession: self.networkSession), isUpload: true)
+        let response: FetchResponse = try await NetworkClient.shared.fetch(options: FetchOptions(url: "\(self.networkSession.baseUrls.uploadUrl)/2.0/files/upload_sessions/\(uploadSessionId)", method: "PUT", headers: headersMap, fileURL: requestBody, contentType: "application/octet-stream", responseFormat: "json", auth: self.auth, networkSession: self.networkSession), isUpload: true)
         return try UploadedPart.deserialize(from: response.data)
     }
 
@@ -225,10 +225,10 @@ public class ChunkedUploadsManager {
         return try Files.deserialize(from: response.data)
     }
 
-    public func reducer(acc: PartAccumulator, chunk: InputStream) async throws -> PartAccumulator {
+    public func reducer(acc: PartAccumulator, chunk: URL) async throws -> PartAccumulator {
         let lastIndex: Int64 = acc.lastIndex
         let parts: [UploadPart] = acc.parts
-        let chunkBuffer: Data = Utils.readByteStream(byteStream: chunk)
+        let chunkBuffer: Data = Utils.readBufferFromFile(url: chunk)
         let hash: Hash = Hash(algorithm: HashName.sha1)
         hash.updateHash(data: chunkBuffer)
         let sha1: String = await hash.digestHash(encoding: "base64")
@@ -237,7 +237,7 @@ public class ChunkedUploadsManager {
         let bytesStart: Int64 = lastIndex + 1
         let bytesEnd: Int64 = lastIndex + Int64(chunkSize)
         let contentRange: String = "\("bytes ")\(Utils.Strings.toString(value: bytesStart)!)\("-")\(Utils.Strings.toString(value: bytesEnd)!)\("/")\(Utils.Strings.toString(value: acc.fileSize)!)"
-        let uploadedPart: UploadedPart = try await self.uploadFilePartByUrl(url: acc.uploadPartUrl, requestBody: Utils.generateByteStreamFromBuffer(buffer: chunkBuffer), headers: UploadFilePartByUrlHeaders(digest: digest, contentRange: contentRange))
+        let uploadedPart: UploadedPart = try await self.uploadFilePartByUrl(url: acc.uploadPartUrl, requestBody: chunk, headers: UploadFilePartByUrlHeaders(digest: digest, contentRange: contentRange))
         let part: UploadPart = uploadedPart.part!
         let partSha1: String = Utils.Strings.hextToBase64(value: part.sha1!)
         assert(partSha1 == sha1)
@@ -250,13 +250,13 @@ public class ChunkedUploadsManager {
     /// Starts the process of chunk uploading a big file. Should return a File object representing uploaded file.
     ///
     /// - Parameters:
-    ///   - file: The stream of the file to upload.
+    ///   - fileURL: The local file URL of the file to upload.
     ///   - fileName: The name of the file, which will be used for storage in Box.
     ///   - fileSize: The total size of the file for the chunked upload in bytes.
     ///   - parentFolderId: The ID of the folder where the file should be uploaded.
     /// - Returns: The `FileFull`.
     /// - Throws: The `GeneralError`.
-    public func uploadBigFile(file: InputStream, fileName: String, fileSize: Int64, parentFolderId: String) async throws -> FileFull {
+    public func uploadBigFile(fileURL: URL, fileName: String, fileSize: Int64, parentFolderId: String) async throws -> FileFull {
         let uploadSession: UploadSession = try await self.createFileUploadSession(requestBody: CreateFileUploadSessionRequestBody(folderId: parentFolderId, fileSize: fileSize, fileName: fileName))
         let uploadPartUrl: String = uploadSession.sessionEndpoints!.uploadPart!
         let commitUrl: String = uploadSession.sessionEndpoints!.commit!
@@ -266,7 +266,7 @@ public class ChunkedUploadsManager {
         assert(partSize * Int64(totalParts) >= fileSize)
         assert(uploadSession.numPartsProcessed == 0)
         let fileHash: Hash = Hash(algorithm: HashName.sha1)
-        let chunksIterator: StreamSequence = Utils.iterateChunks(stream: file, chunkSize: partSize, fileSize: fileSize)
+        let chunksIterator: URLSequence = Utils.iterateChunks(fileURL: fileURL, chunkSize: partSize, fileSize: fileSize)
         let results: PartAccumulator = try await Utils.reduceIterator(iterator: chunksIterator, reducer: self.reducer, initialValue: PartAccumulator(lastIndex: -1, parts: [], fileSize: fileSize, uploadPartUrl: uploadPartUrl, fileHash: fileHash))
         let parts: [UploadPart] = results.parts
         let processedSessionParts: UploadParts = try await self.getFileUploadSessionPartsByUrl(url: listPartsUrl)

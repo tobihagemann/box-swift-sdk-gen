@@ -35,8 +35,8 @@ public class FetchOptions {
     /// Body of the request.
     public let data: SerializedData?
 
-    /// A stream containing the file contents.
-    public let fileStream: InputStream?
+    /// The local file URL containing the file to be uploaded.
+    public let fileURL: URL?
 
     /// Parts of multipart data.
     public let multipartData: [MultipartItem]?
@@ -77,7 +77,7 @@ public class FetchOptions {
         params: [String : ParameterConvertible?] = [:],
         headers: [String : ParameterConvertible?] = [:],
         data: SerializedData? = nil,
-        fileStream: InputStream? = nil,
+        fileURL: URL? = nil,
         multipartData: [MultipartItem]? = nil,
         downloadDestinationURL: URL? = nil,
         contentType: String? = nil,
@@ -90,33 +90,12 @@ public class FetchOptions {
         self.headers = headers
         self.params = params
         self.data = data
-        self.fileStream = fileStream
+        self.fileURL = fileURL
         self.multipartData = multipartData
         self.downloadDestinationURL = downloadDestinationURL
         self.contentType = contentType
         self.responseFormat = responseFormat
         self.auth = auth
         self.networkSession = networkSession
-    }
-
-    /// Creates a new `FetchOptions` object with an updated file stream.
-    ///
-    /// - Parameter fileStream: The new input stream for file uploads.
-    /// - Returns: A new `FetchOptions` instance with the updated file stream.
-    func withFileStream(fileStream: InputStream) -> FetchOptions {
-        return FetchOptions(
-            url: url,
-            method: method,
-            params: params,
-            headers: headers,
-            data: data,
-            fileStream: fileStream,
-            multipartData: multipartData,
-            downloadDestinationURL: downloadDestinationURL,
-            contentType: contentType,
-            responseFormat: responseFormat,
-            auth: auth,
-            networkSession: networkSession
-        )
     }
 }
